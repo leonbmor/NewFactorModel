@@ -1,0 +1,1263 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+"""
+Factor Model - Step 1
+======================
+Sequential Fama-MacBeth factor residualization.
+Factors added in order of relevance, validated by variance reduction.
+
+Steps:
+  1. UFV       : full variance of raw returns (baseline, from st_dt)
+  2. mkt_UFV   : + market beta (EWMA, hl=126, window=252)
+  3. size_UFV  : + size (z-scored log market cap, cross-sectional)
+  4. sec_UFV   : + sector dummies (reference: XLP)
+  5. joint_UFV : + idio momentum + 21d reversal + SI composite (joint multivariate OLS)
+
+Key design:
+  - Dynamic size: shares from valuation_consolidated × daily price from Pxs_df
+    Cached in DB table 'dynamic_size_df', only new dates computed on each run
+  - Common sample: all variance stats computed on the intersection of dates/stocks
+    where ALL characteristics are available → clean apples-to-apples comparisons
+  - OLS weights: log(dynamic_size), normalized inside WLS
+  - All residuals and lambda tables saved to DB
+
+Usage:
+    from factor_model_step1 import run
+    results = run(Pxs_df, sectors_s)
+"""
+
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine, text
+import warnings
+warnings.filterwarnings('ignore')
+
+ENGINE           = create_engine("postgresql+psycopg2://postgres:akf7a7j5@localhost:5432/factormodel_db")
+DYNAMIC_SIZE_TBL = 'dynamic_size_df'
+BETA_WINDOW      = 252
+BETA_HL          = 126
+MOM_LONG         = 252
+MOM_SKIP         = 21
+MOM_LONG_BUFFER  = MOM_LONG
+MIN_STOCKS       = 150
+SECTOR_REF       = 'XLP'
+SI_COMPOSITE_TBL = 'si_composite_df'
+SI_HORIZON       = 21        # forward return horizon for SI signal (trading days)
+
+
+# ==============================================================================
+# HELPERS
+# ==============================================================================
+
+def clean_ticker(t: str) -> str:
+    return t.strip().split(' ')[0].upper()
+
+
+def zscore(s: pd.Series) -> pd.Series:
+    mu, sd = s.mean(), s.std()
+    if sd == 0 or np.isnan(sd):
+        return pd.Series(0.0, index=s.index)
+    return (s - mu) / sd
+
+
+# ==============================================================================
+# UNIVERSE
+# ==============================================================================
+
+def get_universe(Pxs_df: pd.DataFrame, sectors_s: pd.Series,
+                 extended_st_dt: pd.Timestamp) -> list:
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT ticker FROM income_data
+        """)).fetchall()
+    db_tickers  = {r[0].upper() for r in rows}
+    etf_tickers = set(sectors_s.values)
+    pre_dates   = Pxs_df.index[Pxs_df.index < extended_st_dt]
+
+    universe = []
+    for col in Pxs_df.columns:
+        if col in ('SPX',) or col in etf_tickers:
+            continue
+        if col.upper() not in db_tickers:
+            continue
+        if col not in sectors_s.index:
+            continue
+        if len(pre_dates) >= BETA_WINDOW:
+            col_data = Pxs_df.loc[pre_dates[-BETA_WINDOW:], col]
+            if isinstance(col_data, pd.DataFrame):
+                col_data = col_data.iloc[:, 0]
+            if int(col_data.notna().sum()) < BETA_WINDOW // 2:
+                continue
+        universe.append(col)
+
+    print(f"  Universe: {len(universe)} stocks "
+          f"(in DB + sector mapped + sufficient history)")
+    return universe
+
+
+# ==============================================================================
+# DYNAMIC SIZE — DB CACHED
+# ==============================================================================
+
+def _compute_dynamic_size_for_dates(dates_to_calc: pd.DatetimeIndex,
+                                     universe: list,
+                                     Pxs_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each date in dates_to_calc and each stock in universe:
+      shares   = Size_db / Price_db  (last available Size in valuation_consolidated
+                                      before calc_date, Price from Pxs_df on same date)
+      dyn_size = shares * Price on calc_date
+      Fallback: if Price_db is NaN -> use Size_db as-is
+    """
+    us_tickers = [t + ' US' for t in universe]
+
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT date, ticker, "Size"
+            FROM valuation_consolidated
+            WHERE "Size" IS NOT NULL
+              AND ticker = ANY(:tickers)
+            ORDER BY ticker, date
+        """), {"tickers": us_tickers}).fetchall()
+
+    size_raw           = pd.DataFrame(rows, columns=['date', 'ticker', 'Size'])
+    size_raw['date']   = pd.to_datetime(size_raw['date'])
+    size_raw['ticker'] = size_raw['ticker'].str.replace(' US', '', regex=False)
+
+    size_pivot = size_raw.pivot_table(
+        index='date', columns='ticker', values='Size', aggfunc='last'
+    )
+
+    # Forward fill to all Pxs_df dates to get last known Size_db per date
+    all_px_dates = Pxs_df.index
+    size_ff      = size_pivot.reindex(all_px_dates).ffill().bfill()
+
+    # Track which DB date each forward-filled value came from
+    date_indicator = pd.DataFrame(
+        index=size_pivot.index,
+        columns=size_pivot.columns,
+        data=np.tile(
+            size_pivot.index.values.reshape(-1, 1),
+            (1, len(size_pivot.columns))
+        )
+    )
+    date_indicator = date_indicator.reindex(all_px_dates).ffill().bfill()
+
+    # Build price lookup dict per ticker for fast access
+    results = {}
+    for dt in dates_to_calc:
+        if dt not in Pxs_df.index:
+            continue
+        row = {}
+        for ticker in universe:
+            if ticker not in size_ff.columns:
+                continue
+            size_db = size_ff.loc[dt, ticker]
+            if pd.isna(size_db):
+                continue
+
+            # Price on DB snapshot date
+            db_date   = pd.Timestamp(date_indicator.loc[dt, ticker])
+            price_db  = Pxs_df.loc[db_date, ticker] \
+                        if db_date in Pxs_df.index else np.nan
+
+            # Current price
+            price_t   = Pxs_df.loc[dt, ticker]
+
+            if pd.isna(price_db) or price_db == 0 or pd.isna(price_t):
+                row[ticker] = size_db          # fallback
+            else:
+                shares      = size_db / price_db
+                row[ticker] = shares * price_t
+
+        results[dt] = row
+
+    df             = pd.DataFrame(results).T
+    df.index.name  = 'date'
+    df             = df.reindex(columns=universe)
+    return df
+
+
+def load_dynamic_size(universe: list,
+                       Pxs_df: pd.DataFrame,
+                       all_calc_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Load dynamic size from DB cache, computing only missing dates.
+    Returns DataFrame: date x ticker (all dates in all_calc_dates).
+    """
+    # Check which dates already exist in DB
+    already_done = set()
+    try:
+        with ENGINE.connect() as conn:
+            # Check table exists
+            exists = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = :t
+                )
+            """), {"t": DYNAMIC_SIZE_TBL}).scalar()
+
+        if exists:
+            with ENGINE.connect() as conn:
+                rows = conn.execute(text(f"""
+                    SELECT DISTINCT date FROM {DYNAMIC_SIZE_TBL}
+                """)).fetchall()
+            already_done = {pd.Timestamp(r[0]) for r in rows}
+    except Exception:
+        pass
+
+    dates_to_calc = [d for d in all_calc_dates if d not in already_done]
+
+    if dates_to_calc:
+        print(f"  Computing dynamic size for {len(dates_to_calc)} new dates "
+              f"({len(already_done)} already in DB)...")
+        new_df = _compute_dynamic_size_for_dates(
+            pd.DatetimeIndex(dates_to_calc), universe, Pxs_df
+        )
+        # Save new dates to DB
+        long           = new_df.stack(dropna=False).reset_index()
+        long.columns   = ['date', 'ticker', 'size']
+        long           = long.dropna(subset=['size'])
+        long['date']   = pd.to_datetime(long['date'])
+
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {DYNAMIC_SIZE_TBL} (
+                    date   DATE,
+                    ticker VARCHAR(20),
+                    size   NUMERIC,
+                    PRIMARY KEY (date, ticker)
+                )
+            """))
+        long.to_sql(DYNAMIC_SIZE_TBL, ENGINE, if_exists='append', index=False)
+        print(f"  Saved {len(long):,} new rows to '{DYNAMIC_SIZE_TBL}'")
+    else:
+        print(f"  Dynamic size: all {len(all_calc_dates)} dates already in DB")
+
+    # Load full table for requested dates
+    date_list = [d.date() for d in all_calc_dates]
+    print(f"  Loading dynamic size from DB...")
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT date, ticker, size FROM {DYNAMIC_SIZE_TBL}
+            WHERE date = ANY(:dates)
+        """), {"dates": date_list}).fetchall()
+
+    df             = pd.DataFrame(rows, columns=['date', 'ticker', 'size'])
+    df['date']     = pd.to_datetime(df['date'])
+    df['size']     = df['size'].astype(float)
+    pivot          = df.pivot_table(index='date', columns='ticker',
+                                    values='size', aggfunc='last')
+    pivot          = pivot.reindex(columns=universe)
+    print(f"  Dynamic size loaded: {pivot.shape}")
+    return pivot
+
+
+def get_log_size(dynamic_size: pd.DataFrame,
+                 calc_date: pd.Timestamp,
+                 valid_idx: pd.Index) -> pd.Series:
+    """
+    Returns log(dynamic_size) for valid_idx on calc_date.
+    Used as OLS weights (not z-scored — normalization inside WLS).
+    Falls back to 1.0 where missing.
+    """
+    if calc_date not in dynamic_size.index:
+        return pd.Series(1.0, index=valid_idx)
+    s = dynamic_size.loc[calc_date, valid_idx].reindex(valid_idx)
+    s = np.log(s.clip(lower=1).fillna(1))
+    return s
+
+
+# ==============================================================================
+# SECTOR DUMMIES
+# ==============================================================================
+
+def build_sector_dummies(universe: list, sectors_s: pd.Series) -> pd.DataFrame:
+    sectors_dedup = sectors_s[~sectors_s.index.duplicated(keep='first')]
+    etfs          = sorted(set(
+        sectors_dedup.loc[sectors_dedup.index.isin(universe)].dropna().values
+    ))
+    etfs_use      = [e for e in etfs if e != SECTOR_REF]
+
+    dummies = pd.DataFrame(0, index=universe, columns=etfs_use)
+    for stk in universe:
+        etf = sectors_dedup.get(stk)
+        if etf is not None and etf in etfs_use:
+            dummies.loc[stk, etf] = 1
+
+    print(f"  Sector dummies: {len(etfs_use)} sectors "
+          f"(reference: {SECTOR_REF} dropped)")
+    return dummies
+
+
+# ==============================================================================
+# ROLLING CHARACTERISTICS
+# ==============================================================================
+
+def calc_rolling_betas(Pxs_df: pd.DataFrame, universe: list,
+                        calc_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    print("  Calculating rolling EWMA betas...")
+    spx_rets  = Pxs_df['SPX'].pct_change()
+    stk_rets  = Pxs_df[universe].pct_change()
+    all_dates = Pxs_df.index
+    betas     = {}
+
+    for dt in calc_dates:
+        window   = all_dates[all_dates < dt][-BETA_WINDOW:]
+        if len(window) < BETA_WINDOW // 2:
+            continue
+
+        spx_w    = spx_rets.loc[window].values
+        stk_w_df = stk_rets.loc[window].fillna(0)
+        cols     = stk_w_df.columns.tolist()
+        stk_w    = stk_w_df.values
+
+        n        = len(window)
+        alpha    = 1 - np.exp(-np.log(2) / BETA_HL)
+        weights  = np.array([(1 - alpha) ** (n - 1 - i) for i in range(n)])
+        weights /= weights.sum()
+
+        spx_mean = np.dot(weights, spx_w)
+        stk_mean = stk_w.T @ weights
+        spx_dev  = spx_w - spx_mean
+        stk_dev  = stk_w - stk_mean[np.newaxis, :]
+
+        cov      = (stk_dev * spx_dev[:, np.newaxis] *
+                    weights[:, np.newaxis]).sum(axis=0)
+        var_spx  = np.dot(weights, spx_dev ** 2)
+
+        beta_t    = cov / var_spx if var_spx > 0 \
+                    else np.full(len(cols), np.nan)
+        betas[dt] = pd.Series(beta_t, index=cols)
+
+    beta_df = pd.DataFrame(betas).T.reindex(columns=universe)
+    beta_df.index.name = 'date'
+    print(f"  Betas computed: {len(beta_df)} dates")
+    return beta_df
+
+
+def calc_idio_momentum(resid_sec_df: pd.DataFrame,
+                        calc_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Idiosyncratic momentum: cumulative sum of sector residuals
+    over [t-MOM_LONG, t-MOM_SKIP], z-scored cross-sectionally.
+    """
+    print("  Calculating idiosyncratic momentum from sec residuals...")
+    all_resid_dates = resid_sec_df.index
+    mom_dict        = {}
+
+    for dt in calc_dates:
+        past = all_resid_dates[all_resid_dates < dt]
+        if len(past) < MOM_LONG + 1:
+            continue
+
+        window = past[-MOM_LONG:-MOM_SKIP]
+        if len(window) < MOM_LONG - MOM_SKIP - 10:
+            continue
+
+        cum_resid = resid_sec_df.loc[window].sum(axis=0)
+        valid     = cum_resid.dropna()
+
+        if len(valid) < MIN_STOCKS:
+            continue
+
+        mom_dict[dt] = zscore(valid)
+
+    mom_df = pd.DataFrame(mom_dict).T.reindex(columns=resid_sec_df.columns)
+    mom_df.index.name = 'date'
+    print(f"  Idiosyncratic momentum computed: {len(mom_df)} dates")
+    return mom_df
+
+
+def calc_idio_momentum_volscaled(resid_sec_df: pd.DataFrame,
+                                  volumeTrd_df: pd.DataFrame,
+                                  calc_dates: pd.DatetimeIndex,
+                                  vol_lower: float = 0.5,
+                                  vol_upper: float = 3.0) -> pd.DataFrame:
+    """
+    Volume-scaled idiosyncratic momentum.
+    Each day's idio return is weighted by:
+        vol_scalar(t) = clip(volume(t) / mean(volume[t-10, t-1]), vol_lower, vol_upper)
+    Cumulative volume-weighted idio return over [t-MOM_LONG, t-MOM_SKIP],
+    z-scored cross-sectionally per date.
+    Zeros in volume replaced with NaN and forward-filled before scaling.
+    """
+    print(f"  Calculating volume-scaled idio momentum "
+          f"(clip=[{vol_lower}, {vol_upper}])...")
+
+    # Clean volume: zero -> NaN -> ffill
+    vol_clean = volumeTrd_df.replace(0, np.nan).ffill()
+
+    all_resid_dates = resid_sec_df.index
+    mom_dict        = {}
+
+    for dt in calc_dates:
+        past = all_resid_dates[all_resid_dates < dt]
+        if len(past) < MOM_LONG + 1:
+            continue
+
+        window = past[-MOM_LONG:-MOM_SKIP]
+        if len(window) < MOM_LONG - MOM_SKIP - 10:
+            continue
+
+        # Volume scalar: current vol / mean of prior 10 days
+        vol_scalars = {}
+        for day in window:
+            day_pos = all_resid_dates.get_loc(day)
+            if day_pos < 10:
+                continue
+            prior_10  = all_resid_dates[day_pos - 10: day_pos]
+            if day not in vol_clean.index:
+                continue
+            prior_vol = vol_clean.loc[
+                vol_clean.index.intersection(prior_10)
+            ].mean(axis=0)
+            curr_vol  = vol_clean.loc[day]
+            scalar    = (curr_vol / prior_vol.replace(0, np.nan)).clip(
+                lower=vol_lower, upper=vol_upper
+            )
+            vol_scalars[day] = scalar
+
+        if not vol_scalars:
+            continue
+
+        vol_scalar_df = pd.DataFrame(vol_scalars).T   # days x tickers
+        resid_window  = resid_sec_df.loc[
+            resid_sec_df.index.intersection(vol_scalar_df.index)
+        ]
+        if resid_window.empty:
+            continue
+
+        # Align and compute volume-weighted cumulative idio return
+        common_days   = resid_window.index.intersection(vol_scalar_df.index)
+        weighted_sum  = (resid_window.loc[common_days] *
+                         vol_scalar_df.loc[common_days]).sum(axis=0)
+        valid         = weighted_sum.dropna()
+
+        if len(valid) < MIN_STOCKS:
+            continue
+
+        mom_dict[dt] = zscore(valid)
+
+    mom_df            = pd.DataFrame(mom_dict).T.reindex(columns=resid_sec_df.columns)
+    mom_df.index.name = 'date'
+    print(f"  Volume-scaled idio momentum computed: {len(mom_df)} dates")
+    return mom_df
+
+
+def calc_reversal_21d(Pxs_df: pd.DataFrame,
+                       universe: list,
+                       calc_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Short-term reversal: log(P[t-1] / P[t-22])
+    Captures last 21 trading days of raw price performance.
+    Expected sign: negative (recent winners mean-revert).
+    Z-scored cross-sectionally per date.
+    """
+    print("  Calculating 21-day short-term reversal from prices...")
+    all_px_dates = Pxs_df.index
+    rev_dict     = {}
+
+    for dt in calc_dates:
+        past = all_px_dates[all_px_dates < dt]
+        if len(past) < 22:
+            continue
+
+        p_recent = Pxs_df.loc[past[-1],  universe]   # yesterday
+        p_old    = Pxs_df.loc[past[-22], universe]   # 21 trading days ago
+
+        valid_mask = (p_recent > 0) & (p_old > 0)
+        rev        = np.log(p_recent / p_old).where(valid_mask).dropna()
+
+        if len(rev) < MIN_STOCKS:
+            continue
+
+        rev_dict[dt] = zscore(rev)
+
+    rev_df            = pd.DataFrame(rev_dict).T.reindex(columns=universe)
+    rev_df.index.name = 'date'
+    print(f"  21d reversal computed: {len(rev_df)} dates")
+    return rev_df
+
+
+# ==============================================================================
+# CROSS-SECTIONAL WLS
+# ==============================================================================
+
+def wls_cross_section(y: pd.Series, X: pd.DataFrame,
+                       w: pd.Series) -> tuple:
+    idx  = y.index.intersection(X.index).intersection(w.index)
+    if len(idx) < 10:
+        return None, None, None
+
+    y_   = y.loc[idx].values
+    X_   = np.column_stack([np.ones(len(idx)), X.loc[idx].values])
+    w_   = w.loc[idx].values
+    w_   = np.where(np.isnan(w_) | (w_ <= 0), 1.0, w_)
+    w_   = w_ / w_.sum()
+
+    W    = np.diag(w_)
+    try:
+        XtW  = X_.T @ W
+        lam  = np.linalg.solve(XtW @ X_, XtW @ y_)
+    except np.linalg.LinAlgError:
+        return None, None, None
+
+    fitted  = X_ @ lam
+    resid   = y_ - fitted
+    ss_res  = np.dot(w_, resid ** 2)
+    ss_tot  = np.dot(w_, (y_ - np.dot(w_, y_)) ** 2)
+    r2      = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    return lam, pd.Series(resid, index=idx), r2
+
+
+def wls_ridge_cross_section(y: pd.Series, X: pd.DataFrame,
+                             w: pd.Series, ridge_lambda: float = 0.0) -> tuple:
+    """
+    Weighted least squares with optional L2 (ridge) regularization.
+    Intercept is NOT penalized — ridge penalty applied to slope coefficients only.
+    ridge_lambda=0.0 reduces to standard WLS (same as wls_cross_section).
+    """
+    idx  = y.index.intersection(X.index).intersection(w.index)
+    if len(idx) < 10:
+        return None, None, None
+
+    y_   = y.loc[idx].values
+    X_   = np.column_stack([np.ones(len(idx)), X.loc[idx].values])
+    w_   = w.loc[idx].values
+    w_   = np.where(np.isnan(w_) | (w_ <= 0), 1.0, w_)
+    w_   = w_ / w_.sum()
+
+    W    = np.diag(w_)
+    XtW  = X_.T @ W
+    XtWX = XtW @ X_
+
+    # Ridge penalty — intercept (col 0) unpenalized, slopes penalized
+    n_slopes = X_.shape[1] - 1
+    pen      = np.zeros(X_.shape[1])
+    pen[1:]  = ridge_lambda                         # skip intercept
+    XtWX_reg = XtWX + np.diag(pen)
+
+    try:
+        lam = np.linalg.solve(XtWX_reg, XtW @ y_)
+    except np.linalg.LinAlgError:
+        return None, None, None
+
+    fitted  = X_ @ lam
+    resid   = y_ - fitted
+    ss_res  = np.dot(w_, resid ** 2)
+    ss_tot  = np.dot(w_, (y_ - np.dot(w_, y_)) ** 2)
+    r2      = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    return lam, pd.Series(resid, index=idx), r2
+
+
+# ==============================================================================
+# STORAGE
+# ==============================================================================
+
+def save_lambdas(lambda_df: pd.DataFrame, table_name: str):
+    with ENGINE.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+    lambda_df.to_sql(table_name, ENGINE, if_exists='replace',
+                     index=True, index_label='date')
+    print(f"  Lambdas saved to '{table_name}' ({len(lambda_df)} rows)")
+
+
+def save_residuals(resid_df: pd.DataFrame, table_name: str):
+    print(f"  Saving residuals to '{table_name}'...")
+    long           = resid_df.stack().reset_index()
+    long.columns   = ['date', 'ticker', 'resid']
+    long['date']   = pd.to_datetime(long['date'])
+
+    with ENGINE.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+        conn.execute(text(f"""
+            CREATE TABLE {table_name} (
+                date   DATE,
+                ticker VARCHAR(20),
+                resid  NUMERIC,
+                PRIMARY KEY (date, ticker)
+            )
+        """))
+    long.to_sql(table_name, ENGINE, if_exists='append', index=False)
+    print(f"  Saved {len(long):,} rows "
+          f"({resid_df.shape[0]} dates x {resid_df.shape[1]} stocks)")
+
+
+# ==============================================================================
+# VARIANCE / R2 / LAMBDA STATS
+# ==============================================================================
+
+def variance_stats(resid_df: pd.DataFrame, label: str,
+                    reference_var: float = None) -> float:
+    vals = resid_df.values.flatten()
+    vals = vals[~np.isnan(vals)]
+    var  = float(np.var(vals))
+    std  = float(np.std(vals))
+
+    print(f"\n  [{label}]")
+    print(f"    Pooled variance : {var:.8f}")
+    print(f"    Pooled std dev  : {std:.6f}")
+    print(f"    N observations  : {len(vals):,}")
+    if reference_var is not None:
+        print(f"    % of reference  : {var / reference_var * 100:.2f}%")
+    return var
+
+
+def r2_stats(r2_series: pd.Series, label: str):
+    r2 = r2_series.dropna()
+    print(f"\n  [{label}] Daily cross-sectional R²:")
+    print(f"    Mean   : {r2.mean():.4f}")
+    print(f"    Median : {r2.median():.4f}")
+    print(f"    10th   : {r2.quantile(0.10):.4f}")
+    print(f"    90th   : {r2.quantile(0.90):.4f}")
+
+
+def lambda_stats(series: pd.Series, label: str) -> float:
+    s       = series.dropna()
+    mean    = s.mean()
+    std     = s.std()
+    t_stat  = mean / (std / np.sqrt(len(s)))
+    pct_pos = (s > 0).mean() * 100
+
+    print(f"\n  {label}")
+    print(f"    N          : {len(s):,}")
+    print(f"    Mean       : {mean:+.6f}")
+    print(f"    Std        : {std:.6f}")
+    print(f"    t-stat     : {t_stat:+.2f}")
+    print(f"    % positive : {pct_pos:.1f}%")
+    print(f"    Min        : {s.min():+.6f}")
+    print(f"    5th pct    : {s.quantile(0.05):+.6f}")
+    print(f"    Median     : {s.median():+.6f}")
+    print(f"    95th pct   : {s.quantile(0.95):+.6f}")
+    print(f"    Max        : {s.max():+.6f}")
+    return t_stat
+
+
+def print_lambda_summary(lambda_df: pd.DataFrame,
+                          factor_cols: list,
+                          step_label: str,
+                          common_dates: pd.DatetimeIndex,
+                          annual_col: str = None):
+    """Stats computed on common_dates only for clean comparability."""
+    lm = lambda_df[lambda_df.index.isin(common_dates)].copy()
+
+    print(f"\n{'='*70}")
+    print(f"  LAMBDA DISTRIBUTIONS — {step_label} (common sample)")
+    print(f"{'='*70}")
+
+    for col in factor_cols:
+        if col not in lm.columns:
+            continue
+        lambda_stats(lm[col], f"lambda_{col}")
+
+        if col == annual_col:
+            clean = lm[col].dropna()
+            print(f"\n  Annual breakdown ({col}):")
+            print(f"  {'Year':<6} {'Mean':>12} {'t-stat':>10} {'%pos':>8}")
+            print(f"  {'-'*40}")
+            for yr, grp in clean.groupby(clean.index.year):
+                mean  = grp.mean()
+                t     = mean / (grp.std() / np.sqrt(len(grp)))
+                pct_p = (grp > 0).mean() * 100
+                print(f"  {yr:<6} {mean:>+12.6f} {t:>+10.2f} {pct_p:>7.1f}%")
+            cum = clean.cumsum()
+            print(f"\n  Cumulative {col} lambda: {cum.iloc[-1]:+.4f}")
+
+    print("\n--- Intercept ---")
+    lambda_stats(lm['intercept'], "lambda_0 (intercept)")
+
+
+def print_sector_lambdas(lambda_df: pd.DataFrame,
+                          sec_cols: list,
+                          common_dates: pd.DatetimeIndex):
+    lm = lambda_df[lambda_df.index.isin(common_dates)]
+    print(f"\n  Sector lambdas ({len(sec_cols)} sectors):")
+    print(f"  {'Sector':<10} {'Mean':>10} {'Std':>10} {'t-stat':>10} {'%pos':>8}")
+    print(f"  {'-'*52}")
+    for col in sorted(sec_cols):
+        if col not in lm.columns:
+            continue
+        s       = lm[col].dropna()
+        mean    = s.mean()
+        std     = s.std()
+        t       = mean / (std / np.sqrt(len(s)))
+        pct_pos = (s > 0).mean() * 100
+        print(f"  {col:<10} {mean:>+10.6f} {std:>10.6f} {t:>+10.2f} {pct_pos:>7.1f}%")
+
+
+# ==============================================================================
+# GENERIC FACTOR STEP RUNNER
+# ==============================================================================    return summary
+
+
+# ==============================================================================
+# GENERIC FACTOR STEP RUNNER
+# ==============================================================================
+
+def run_factor_step(factor_cols: list,
+                     char_by_date: dict,
+                     all_rets: pd.DataFrame,
+                     dynamic_size: pd.DataFrame,
+                     calc_dates: pd.DatetimeIndex,
+                     universe: list,
+                     ridge_lambda: float = 0.0) -> tuple:
+    resid_dict  = {}
+    lambda_dict = {}
+    r2_dict     = {}
+
+    for dt in calc_dates:
+        y = all_rets.loc[dt, universe].dropna()
+        if len(y) < MIN_STOCKS:
+            continue
+
+        valid_idx = y.index
+        X_parts   = []
+
+        for col, char_df in char_by_date.items():
+            if dt not in char_df.index:
+                valid_idx = pd.Index([])
+                break
+            s         = char_df.loc[dt].reindex(valid_idx).dropna()
+            valid_idx = s.index
+            X_parts.append(s.rename(col))
+
+        if len(valid_idx) < MIN_STOCKS or not X_parts:
+            continue
+
+        X  = pd.concat(X_parts, axis=1).loc[valid_idx]
+        y_ = y.loc[valid_idx]
+        w_ = get_log_size(dynamic_size, dt, valid_idx)
+
+        lam, resid, r2 = wls_ridge_cross_section(y_, X, w_, ridge_lambda=ridge_lambda)
+        if resid is None:
+            continue
+
+        resid_dict[dt]  = resid
+        r2_dict[dt]     = r2
+        cols            = ['intercept'] + factor_cols
+        lambda_dict[dt] = {**dict(zip(cols, lam)), 'r2': r2}
+
+    resid_df  = pd.DataFrame(resid_dict).T
+    lambda_df = pd.DataFrame(lambda_dict).T
+    lambda_df.index.name = 'date'
+    r2_s      = pd.Series(r2_dict)
+
+    return resid_df, lambda_df, r2_s
+
+
+# ==============================================================================
+# SHORT INTEREST COMPOSITE — DB CACHED
+# ==============================================================================
+
+def _compute_si_composite_for_dates(dates_to_calc: pd.DatetimeIndex,
+                                     universe: list) -> pd.DataFrame:
+    """
+    For each date in dates_to_calc:
+      1. Load SI % Free Float and Utilization from short_interest_data
+      2. Forward-fill to calc dates (SI is lower frequency than daily)
+      3. Cross-sectional z-score each metric
+      4. Equal-weight composite = (z_si_float + z_utilization) / 2
+    Returns DataFrame: date x ticker
+    """
+    us_tickers = [t + ' US' for t in universe]
+
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT date, ticker,
+                   short_interest_pct_free_float,
+                   short_interest_shares_k,
+                   short_availability_shares_k
+            FROM short_interest_data
+            WHERE ticker = ANY(:tickers)
+            ORDER BY ticker, date
+        """), {"tickers": us_tickers}).fetchall()
+
+    if not rows:
+        print("  WARNING: No SI data found for universe tickers")
+        return pd.DataFrame(index=dates_to_calc, columns=universe, dtype=float)
+
+    df           = pd.DataFrame(rows, columns=[
+        'date', 'ticker', 'si_float', 'si_shares_k', 'avail_shares_k'
+    ])
+    df['date']   = pd.to_datetime(df['date'])
+    df['ticker'] = df['ticker'].str.replace(' US', '', regex=False).str.strip()
+    for col in ['si_float', 'si_shares_k', 'avail_shares_k']:
+        df[col]  = df[col].astype(float)
+
+    df['utilization'] = (
+        df['si_shares_k'] / df['avail_shares_k'].replace(0, np.nan)
+    ).clip(0, 1)
+
+    # Pivot each metric: date x ticker
+    piv_float = df.pivot_table(
+        index='date', columns='ticker', values='si_float', aggfunc='last'
+    )
+    piv_util  = df.pivot_table(
+        index='date', columns='ticker', values='utilization', aggfunc='last'
+    )
+
+    # Reindex to calc dates and forward-fill (SI updates less than daily)
+    piv_float = piv_float.reindex(dates_to_calc).ffill()
+    piv_util  = piv_util.reindex(dates_to_calc).ffill()
+
+    # Fill remaining NaNs with cross-sectional median per date
+    # Stocks missing SI data get a neutral score (~0 after z-scoring)
+    # rather than being dropped from the universe entirely
+    piv_float = piv_float.apply(lambda row: row.fillna(row.median()), axis=1)
+    piv_util  = piv_util.apply(lambda row: row.fillna(row.median()),  axis=1)
+
+    # Cross-sectional z-score per date, equal-weight composite
+    results = {}
+    for dt in dates_to_calc:
+        z_float = zscore(piv_float.loc[dt].dropna()) \
+                  if dt in piv_float.index else pd.Series(dtype=float)
+        z_util  = zscore(piv_util.loc[dt].dropna()) \
+                  if dt in piv_util.index else pd.Series(dtype=float)
+
+        common  = z_float.index.intersection(z_util.index)
+        if len(common) < MIN_STOCKS:
+            continue
+
+        composite       = (z_float.loc[common] + z_util.loc[common]) / 2
+        results[dt]     = composite
+
+    df_out            = pd.DataFrame(results).T.reindex(columns=universe)
+    df_out.index.name = 'date'
+    return df_out
+
+
+def load_si_composite(universe: list,
+                       all_calc_dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Load SI composite from DB cache, computing only missing dates.
+    Returns DataFrame: date x ticker.
+    """
+    already_done = set()
+    try:
+        with ENGINE.connect() as conn:
+            exists = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = :t
+                )
+            """), {"t": SI_COMPOSITE_TBL}).scalar()
+
+        if exists:
+            with ENGINE.connect() as conn:
+                rows = conn.execute(text(
+                    f"SELECT DISTINCT date FROM {SI_COMPOSITE_TBL}"
+                )).fetchall()
+            already_done = {pd.Timestamp(r[0]) for r in rows}
+    except Exception:
+        pass
+
+    dates_to_calc = [d for d in all_calc_dates if d not in already_done]
+
+    if dates_to_calc:
+        print(f"  Computing SI composite for {len(dates_to_calc)} new dates "
+              f"({len(already_done)} already in DB)...")
+        new_df = _compute_si_composite_for_dates(
+            pd.DatetimeIndex(dates_to_calc), universe
+        )
+        long           = new_df.stack(dropna=False).reset_index()
+        long.columns   = ['date', 'ticker', 'si_composite']
+        long           = long.dropna(subset=['si_composite'])
+        long['date']   = pd.to_datetime(long['date'])
+
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS {SI_COMPOSITE_TBL} (
+                    date         DATE,
+                    ticker       VARCHAR(20),
+                    si_composite NUMERIC,
+                    PRIMARY KEY  (date, ticker)
+                )
+            """))
+        long.to_sql(SI_COMPOSITE_TBL, ENGINE, if_exists='append', index=False)
+        print(f"  Saved {len(long):,} new rows to '{SI_COMPOSITE_TBL}'")
+    else:
+        print(f"  SI composite: all {len(all_calc_dates)} dates already in DB")
+
+    # Load full table for requested dates
+    date_list = [d.date() for d in all_calc_dates]
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT date, ticker, si_composite FROM {SI_COMPOSITE_TBL}
+            WHERE date = ANY(:dates)
+        """), {"dates": date_list}).fetchall()
+
+    df             = pd.DataFrame(rows, columns=['date', 'ticker', 'si_composite'])
+    df['date']     = pd.to_datetime(df['date'])
+    df['si_composite'] = df['si_composite'].astype(float)
+    pivot          = df.pivot_table(
+        index='date', columns='ticker', values='si_composite', aggfunc='last'
+    )
+    pivot          = pivot.reindex(columns=universe)
+    # Forward-fill missing dates (SI fetched less frequently than prices)
+    pivot          = pivot.reindex(all_calc_dates).ffill()
+    print(f"  SI composite loaded: {pivot.shape}")
+    return pivot
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+def run(Pxs_df: pd.DataFrame, sectors_s: pd.Series,
+        volumeTrd_df: pd.DataFrame = None) -> dict:
+    print("=" * 70)
+    print("  FACTOR MODEL - STEP 1")
+    print("=" * 70)
+
+    # Deduplicate upfront
+    sectors_s = sectors_s[~sectors_s.index.duplicated(keep='first')]
+    Pxs_df    = Pxs_df.loc[:, ~Pxs_df.columns.duplicated(keep='first')]
+
+    # Start date
+    st_input     = input("\n  Start date (YYYY-MM-DD, or Enter for 2019-01-01): ").strip()
+    st_dt        = pd.Timestamp(st_input) if st_input else pd.Timestamp('2019-01-01')
+    print(f"  Start date       : {st_dt.date()}")
+    ridge_input  = input("  Ridge penalty λ  (or Enter for default=0.1): ").strip()
+    RIDGE_LAMBDA = float(ridge_input) if ridge_input else 0.1
+    print(f"  Ridge penalty    : {RIDGE_LAMBDA}")
+    vol_input    = input("  Volume-scaled momentum? (y/n) [default=n]: ").strip().lower()
+    use_vol_scale = vol_input == 'y'
+    if use_vol_scale:
+        vol_lo_in  = input("    Vol scalar lower bound [default=0.5]: ").strip()
+        vol_hi_in  = input("    Vol scalar upper bound [default=3.0]: ").strip()
+        VOL_LOWER  = float(vol_lo_in) if vol_lo_in else 0.5
+        VOL_UPPER  = float(vol_hi_in) if vol_hi_in else 3.0
+        print(f"  Vol scalar clip  : [{VOL_LOWER}, {VOL_UPPER}]")
+    else:
+        VOL_LOWER, VOL_UPPER = 0.5, 3.0
+
+    # Extended start: MOM_LONG_BUFFER trading days before st_dt
+    all_dates      = Pxs_df.index
+    st_dt_loc      = all_dates.searchsorted(st_dt)
+    ext_loc        = max(0, st_dt_loc - MOM_LONG_BUFFER)
+    extended_st_dt = all_dates[ext_loc]
+    print(f"  Extended start   : {extended_st_dt.date()} "
+          f"({MOM_LONG_BUFFER} trading days before st_dt)")
+
+    # Setup
+    universe   = get_universe(Pxs_df, sectors_s, extended_st_dt)
+    sector_dum = build_sector_dummies(universe, sectors_s)
+    sec_cols   = sector_dum.columns.tolist()
+
+    all_rets   = Pxs_df[universe].pct_change()
+    ext_dates  = all_dates[all_dates >= extended_st_dt]
+    valid_ext  = ext_dates[
+        all_rets.loc[ext_dates, universe].notna().sum(axis=1) >= MIN_STOCKS
+    ]
+    valid_days = valid_ext[valid_ext >= st_dt]
+
+    print(f"  Extended dates   : {len(valid_ext)} (from {extended_st_dt.date()})")
+    print(f"  Valid dates      : {len(valid_days)} "
+          f"(from {st_dt.date()}, for variance stats)")
+
+    # Dynamic size and SI composite — load from DB cache, compute only new dates
+    dynamic_size = load_dynamic_size(universe, Pxs_df, valid_ext)
+    si_composite = load_si_composite(universe, valid_ext)
+
+    # --------------------------------------------------------------------------
+    # Build all characteristics upfront
+    # --------------------------------------------------------------------------
+
+    # Rolling betas
+    beta_df = calc_rolling_betas(Pxs_df, universe, valid_ext)
+
+    # Size characteristic: z-scored log(dynamic_size) cross-sectionally per day
+    print("\n  Building size characteristic (z-scored log market cap)...")
+    size_char_dict = {}
+    for dt in valid_ext:
+        if dt not in dynamic_size.index:
+            continue
+        s = dynamic_size.loc[dt, universe].dropna()
+        s = np.log(s.clip(lower=1))
+        if len(s) < MIN_STOCKS:
+            continue
+        size_char_dict[dt] = zscore(s)
+    size_char_df            = pd.DataFrame(size_char_dict).T.reindex(columns=universe)
+    size_char_df.index.name = 'date'
+    print(f"  Size characteristic built: {len(size_char_df)} dates")
+
+    # Sector dummies expanded to date index
+    dates_ext_common = valid_ext.intersection(beta_df.index).intersection(
+        size_char_df.index
+    )
+    sec_char = {'beta': beta_df, 'size': size_char_df}
+    for col in sec_cols:
+        sec_char[col] = pd.DataFrame(
+            {dt: sector_dum[col] for dt in dates_ext_common}
+        ).T
+
+    # --------------------------------------------------------------------------
+    # Determine COMMON SAMPLE:
+    # Dates where ALL characteristics are available (beta + size + sectors)
+    # Then further intersect with mom dates after mom_12m1 is computed
+    # --------------------------------------------------------------------------
+
+    # Steps 1-3 common dates: beta + size available
+    dates_123 = valid_days.intersection(beta_df.index).intersection(
+        size_char_df.index
+    )
+
+    # --------------------------------------------------------------------------
+    # UFV on common sample
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  BASELINE: UFV (common sample, st_dt onwards)")
+    print("=" * 70)
+
+    # We will define the full common sample after mom is computed.
+    # For UFV we use dates_123 as the reference — refined to dates_mom below.
+    # Store raw returns restricted to dates_123 for now; we'll recompute UFV
+    # on the final common sample at the end.
+    raw_mat_123 = all_rets.loc[dates_123, universe]
+    UFV_123     = variance_stats(raw_mat_123, "UFV - Raw Returns (dates_123)")
+    print(f"\n  UFV (dates_123) = {UFV_123:.8f}")
+
+    # --------------------------------------------------------------------------
+    # STEP 1: Market Beta (extended dates for residual history)
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  STEP 1: Market Beta")
+    print("=" * 70)
+
+    resid_mkt_full, lambda_mkt, r2_mkt = run_factor_step(
+        factor_cols  = ['beta'],
+        char_by_date = {'beta': beta_df},
+        all_rets     = all_rets,
+        dynamic_size = dynamic_size,
+        calc_dates   = dates_ext_common,
+        universe     = universe,
+    )
+
+    # --------------------------------------------------------------------------
+    # STEP 2: Market Beta + Size
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  STEP 2: Market Beta + Size")
+    print("=" * 70)
+
+    resid_size_full, lambda_size, r2_size = run_factor_step(
+        factor_cols  = ['beta', 'size'],
+        char_by_date = {'beta': beta_df, 'size': size_char_df},
+        all_rets     = all_rets,
+        dynamic_size = dynamic_size,
+        calc_dates   = dates_ext_common,
+        universe     = universe,
+    )
+
+    # --------------------------------------------------------------------------
+    # STEP 3: Market Beta + Size + Sectors
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  STEP 3: Market Beta + Size + Sector Dummies")
+    print("=" * 70)
+
+    resid_sec_full, lambda_sec, r2_sec = run_factor_step(
+        factor_cols  = ['beta', 'size'] + sec_cols,
+        char_by_date = sec_char,
+        all_rets     = all_rets,
+        dynamic_size = dynamic_size,
+        calc_dates   = dates_ext_common,
+        universe     = universe,
+    )
+
+    # --------------------------------------------------------------------------
+    # STEP 4: Joint — Idiosyncratic Momentum + 21d Reversal + SI Composite
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  STEP 4: + Idiosyncratic Momentum + 21d Reversal + SI (Joint)")
+    print("=" * 70)
+
+    # Idio momentum from sector residuals (full extended history)
+    if use_vol_scale:
+        if volumeTrd_df is None:
+            print("  WARNING: use_vol_scale=True but volumeTrd_df not provided — "
+                  "falling back to standard idio momentum")
+            mom_df = calc_idio_momentum(resid_sec_full, valid_ext)
+        else:
+            mom_df = calc_idio_momentum_volscaled(
+                resid_sec_full, volumeTrd_df, valid_ext,
+                vol_lower=VOL_LOWER, vol_upper=VOL_UPPER
+            )
+    else:
+        mom_df = calc_idio_momentum(resid_sec_full, valid_ext)
+
+    # 21d reversal from prices (full extended history)
+    rev_df  = calc_reversal_21d(Pxs_df, universe, valid_ext)
+
+    # --------------------------------------------------------------------------
+    # FINAL COMMON SAMPLE: intersection of all characteristic dates (st_dt+)
+    # --------------------------------------------------------------------------
+    common_dates = (dates_123
+                    .intersection(mom_df.index)
+                    .intersection(rev_df.index)
+                    .intersection(si_composite.index))
+    print(f"\n  Common sample: {len(common_dates)} dates "
+          f"(beta + size + sectors + idio_mom + reversal + SI all available, from st_dt)")
+
+    # Full extended dates for DB save (backtest needs max history)
+    mom_dates_full = valid_ext.intersection(mom_df.index)
+    print(f"  Full mom dates : {len(mom_dates_full)} dates "
+          f"(from {mom_dates_full[0].date()} — saved to DB for backtest)")
+
+    # Recompute UFV on final common sample
+    print("\n" + "=" * 70)
+    print("  BASELINE: UFV (final common sample)")
+    print("=" * 70)
+    raw_mat = all_rets.loc[common_dates, universe]
+    UFV     = variance_stats(raw_mat, "UFV - Raw Returns (common sample)")
+    print(f"\n  UFV = {UFV:.8f}")
+
+    # Joint characteristics: idio_mom + reversal + SI all together
+    joint_char = {'beta': beta_df, 'size': size_char_df,
+                  **{col: sec_char[col] for col in sec_cols},
+                  'idio_mom': mom_df, 'reversal': rev_df,
+                  'si_composite': si_composite}
+    joint_cols = ['beta', 'size'] + sec_cols + ['idio_mom', 'reversal', 'si_composite']
+
+    # Full extended dates → residuals for DB (backtest needs full history)
+    full_dates = (valid_ext
+                  .intersection(mom_df.index)
+                  .intersection(rev_df.index)
+                  .intersection(si_composite.index))
+    resid_full, lambda_full, _ = run_factor_step(
+        factor_cols  = joint_cols,
+        char_by_date = joint_char,
+        all_rets     = all_rets,
+        dynamic_size = dynamic_size,
+        calc_dates   = full_dates,
+        universe     = universe,
+        ridge_lambda = RIDGE_LAMBDA,
+    )
+
+    # Common dates only → variance stats and lambda distributions
+    resid_joint, lambda_joint, r2_joint = run_factor_step(
+        factor_cols  = joint_cols,
+        char_by_date = joint_char,
+        all_rets     = all_rets,
+        dynamic_size = dynamic_size,
+        calc_dates   = common_dates,
+        universe     = universe,
+        ridge_lambda = RIDGE_LAMBDA,
+    )
+
+    # Restrict early residuals to common sample for variance stats
+    resid_mkt  = resid_mkt_full[resid_mkt_full.index.isin(common_dates)]
+    resid_size = resid_size_full[resid_size_full.index.isin(common_dates)]
+    resid_sec  = resid_sec_full[resid_sec_full.index.isin(common_dates)]
+
+    # --------------------------------------------------------------------------
+    # Variance stats — all on common sample
+    # --------------------------------------------------------------------------
+    mkt_UFV   = variance_stats(resid_mkt,   "mkt_UFV   - Beta Residuals",             UFV)
+    size_UFV  = variance_stats(resid_size,  "size_UFV  - Beta+Size Residuals",        mkt_UFV)
+    _         = variance_stats(resid_size,  "size_UFV vs UFV",                        UFV)
+    sec_UFV   = variance_stats(resid_sec,   "sec_UFV   - Beta+Size+Sec Residuals",    size_UFV)
+    _         = variance_stats(resid_sec,   "sec_UFV vs UFV",                         UFV)
+    joint_UFV = variance_stats(resid_joint, "joint_UFV - +IdioMom+Reversal+SI",       sec_UFV)
+    _         = variance_stats(resid_joint, "joint_UFV vs UFV",                       UFV)
+
+    # R2 stats on common sample
+    r2_stats(r2_mkt[r2_mkt.index.isin(common_dates)],   "Market Beta")
+    r2_stats(r2_size[r2_size.index.isin(common_dates)],  "Market Beta + Size")
+    r2_stats(r2_sec[r2_sec.index.isin(common_dates)],    "Market Beta + Size + Sectors")
+    r2_stats(r2_joint,                                    "Full Model (Joint)")
+
+    # --------------------------------------------------------------------------
+    # Save to DB (full history for residuals, common sample for lambdas)
+    # --------------------------------------------------------------------------
+    save_lambdas(lambda_mkt[lambda_mkt.index.isin(common_dates)],    'factor_lambdas_mkt')
+    save_lambdas(lambda_size[lambda_size.index.isin(common_dates)],   'factor_lambdas_size')
+    save_lambdas(lambda_sec[lambda_sec.index.isin(common_dates)],     'factor_lambdas_sec')
+    save_lambdas(lambda_joint[lambda_joint.index.isin(common_dates)], 'factor_lambdas_joint')
+
+    save_residuals(resid_mkt_full,  'factor_residuals_mkt')
+    save_residuals(resid_size_full, 'factor_residuals_size')
+    save_residuals(resid_sec_full,  'factor_residuals_sec')
+    save_residuals(resid_full,      'factor_residuals_joint')  # full model residuals
+
+    # --------------------------------------------------------------------------
+    # Lambda distributions — all on common sample
+    # --------------------------------------------------------------------------
+    print_lambda_summary(lambda_mkt,   ['beta'],
+                         "Market Beta", common_dates)
+    print_lambda_summary(lambda_size,  ['beta', 'size'],
+                         "Market Beta + Size", common_dates,
+                         annual_col='size')
+    print_lambda_summary(lambda_sec,   ['beta', 'size'],
+                         "Market Beta + Size + Sectors", common_dates)
+    print_sector_lambdas(lambda_sec, sec_cols, common_dates)
+    print_lambda_summary(lambda_joint, ['beta', 'size', 'idio_mom', 'reversal', 'si_composite'],
+                         "Full Model (Joint: IdioMom + Reversal + SI)", common_dates,
+                         annual_col='si_composite')
+    print_sector_lambdas(lambda_joint, sec_cols, common_dates)
+    # Annual breakdown for each joint signal
+    print_lambda_summary(lambda_joint, ['idio_mom'],
+                         "Annual — Idio Momentum", common_dates,
+                         annual_col='idio_mom')
+    print_lambda_summary(lambda_joint, ['reversal'],
+                         "Annual — 21d Reversal", common_dates,
+                         annual_col='reversal')
+
+    # --------------------------------------------------------------------------
+    # Variance Reduction Summary
+    # --------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("  VARIANCE REDUCTION SUMMARY (common sample)")
+    print("=" * 70)
+    rows = [
+        ("UFV (raw returns)",                    UFV,       UFV,      None),
+        ("mkt_UFV   (+ beta)",                   mkt_UFV,   UFV,      UFV),
+        ("size_UFV  (+ size)",                   size_UFV,  UFV,      mkt_UFV),
+        ("sec_UFV   (+ sectors)",                sec_UFV,   UFV,      size_UFV),
+        ("joint_UFV (+ IdioMom+Rev+SI)",         joint_UFV, UFV,      sec_UFV),
+    ]
+    print(f"  {'':40} {'Variance':>12} {'% UFV':>8} {'% prev':>8}")
+    print(f"  {'-'*72}")
+    for lbl, var, base, prev in rows:
+        pct_ufv  = f"{var/base*100:.2f}%"
+        pct_prev = f"{var/prev*100:.2f}%" if prev else "---"
+        print(f"  {lbl:<40} {var:>12.8f} {pct_ufv:>8} {pct_prev:>8}")
+
+    return {
+        'UFV':              UFV,
+        'mkt_UFV':          mkt_UFV,
+        'size_UFV':         size_UFV,
+        'sec_UFV':          sec_UFV,
+        'joint_UFV':        joint_UFV,
+        'resid_mkt':        resid_mkt,
+        'resid_size':       resid_size,
+        'resid_sec':        resid_sec,
+        'resid_sec_full':   resid_sec_full,
+        'resid_joint':      resid_joint,
+        'resid_full':       resid_full,
+        'lambda_mkt':       lambda_mkt,
+        'lambda_size':      lambda_size,
+        'lambda_sec':       lambda_sec,
+        'lambda_joint':     lambda_joint,
+        'beta_df':          beta_df,
+        'size_char_df':     size_char_df,
+        'dynamic_size':     dynamic_size,
+        'si_composite':     si_composite,
+        'mom_df':           mom_df,    # idio_mom
+        'rev_df':           rev_df,    # 21d reversal
+        'universe':         universe,
+        'sec_cols':         sec_cols,
+        'common_dates':     common_dates,
+        'st_dt':            st_dt,
+        'extended_st_dt':   extended_st_dt,
+    }
+
+
+if __name__ == "__main__":
+    print("Usage: from factor_model_step1 import run")
+    print("       results = run(Pxs_df, sectors_s)")
+    print("       results = run(Pxs_df, sectors_s, volumeTrd_df=volumeTrd_df)  # vol-scaled momentum")
