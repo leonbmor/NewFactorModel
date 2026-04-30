@@ -2711,7 +2711,7 @@ def run(Pxs_df: pd.DataFrame, sectors_s: pd.Series,
 
     full_dates_value = resid_full_mom.index.intersection(
         value_perp.index[value_perp.notna().any(axis=1)])
-    resid_full_value, _, _ = run_factor_step(
+    resid_full_value_step, _, _ = run_factor_step(
         factor_cols  = ['value'],
         char_by_date = {'value': value_perp},
         all_rets     = resid_full_mom,
@@ -2720,6 +2720,17 @@ def run(Pxs_df: pd.DataFrame, sectors_s: pd.Series,
         universe     = universe,
         ridge_lambda = 0.0,
     )
+    # For dates without value data, fall back to momentum residuals
+    missing_value = resid_full_mom.index.difference(resid_full_value_step.index)
+    if len(missing_value) > 0:
+        print(f"  Value step skipped for {len(missing_value)} dates "
+              f"(no value data) — using momentum residuals as fallback")
+        resid_full_value = pd.concat([
+            resid_full_mom.loc[missing_value],
+            resid_full_value_step
+        ]).sort_index()
+    else:
+        resid_full_value = resid_full_value_step
     resid_joint, lambda_joint, r2_joint = run_factor_step(
         factor_cols  = ['value'],
         char_by_date = {'value': value_perp},

@@ -815,11 +815,22 @@ def _v2_run_full(Pxs_df, sectors_s, st_dt, volumeTrd_df=None,
          'idio_mom': mom_perp, 'size': size_perp},
         resid_size_full.index, dynamic_size=dynamic_size
     )
-    resid_value_full, lambda_value, r2_value = run_factor_step(
+    resid_value_step, lambda_value, r2_value = run_factor_step(
         ['value'], {'value': value_perp},
         resid_size_full, dynamic_size,
         resid_size_full.index, universe
     )
+    # For dates without value data, fall back to size residuals
+    missing_value = resid_size_full.index.difference(resid_value_step.index)
+    if len(missing_value) > 0:
+        print(f"  Value step skipped for {len(missing_value)} dates "
+              f"(no value data) — using size residuals as fallback")
+        resid_value_full = pd.concat([
+            resid_size_full.loc[missing_value],
+            resid_value_step
+        ]).sort_index()
+    else:
+        resid_value_full = resid_value_step
 
     # ── Step 7: SI ⊥ {all prior} ─────────────────────────────────────────────
     print("\n" + "="*70)
