@@ -32,10 +32,11 @@ from sqlalchemy import create_engine, text
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-QUALITY_TABLE      = 'valuation_metrics_anchors'
-RESIDUAL_TABLE     = 'factor_residuals_sec'
+QUALITY_TABLE           = 'valuation_metrics_anchors'
+RESIDUAL_TABLE          = 'factor_residuals_sec'
+QUALITY_SCORES_TBL      = 'quality_scores_df'
 QUALITY_WEIGHTS_PIT_TBL = 'quality_weights_pit'
-MAX_HORIZON             = max(HORIZONS)   # 63 days — minimum lag before anchor can contribute
+MAX_HORIZON             = 63   # max forward horizon (days) — anchor needs this many days before cutoff
 
 # ==============================================================================
 # POINT-IN-TIME WEIGHTS CACHE
@@ -97,6 +98,78 @@ def _save_pit_weights(cutoff_date, gqf_w, cqf_w):
         """), rows)
 
 
+def _derive_weights_continuous(weighted_anchors, sectors_s, Pxs_df):
+    """
+    Like derive_weights but accepts {anchor_date: (snapshot, regime_weight)} dict.
+    Each anchor's IC observations are scaled by its regime_weight (0-1).
+    Allows continuous blending rather than binary growth/conservative classification.
+    """
+    eligible_metrics = [m for m in QUALITY_METRICS if m not in EXCLUDE_METRICS]
+    metric_stats = {m: {h: [] for h in HORIZONS} for m in eligible_metrics}
+
+    for anchor, (snap, reg_w) in weighted_anchors.items():
+        if snap is None or snap.empty or reg_w <= 0:
+            continue
+        snap    = build_derived_metrics(snap)
+        ranked  = rank_within_sector(snap, sectors_s, eligible_metrics)
+        u_stats = {}
+        for m in eligible_metrics:
+            if m in ranked.columns:
+                s = ranked[m].dropna()
+                u_stats[m] = (float(s.mean()), float(s.std())) if len(s) > 1 else (np.nan, np.nan)
+        for horizon in HORIZONS:
+            resid = _compute_residuals(Pxs_df, sectors_s, None, anchor, horizon)
+            if resid.empty or len(resid) < MIN_STOCKS:
+                continue
+            n_decile       = max(1, int(np.floor(len(resid) * TOP_PCTILE)))
+            sorted_ret     = resid.sort_values(ascending=False)
+            top_tickers    = sorted_ret.iloc[:n_decile].index
+            bottom_tickers = sorted_ret.iloc[-n_decile:].index
+            for m in eligible_metrics:
+                if m not in ranked.columns:
+                    continue
+                u_mean, u_std = u_stats.get(m, (np.nan, np.nan))
+                if not u_std or u_std <= 0:
+                    continue
+                top_med    = float(ranked[m].reindex(top_tickers).dropna().median())
+                bottom_med = float(ranked[m].reindex(bottom_tickers).dropna().median())
+                if np.isnan(top_med) or np.isnan(bottom_med):
+                    continue
+                # Scale IC observation by regime weight
+                ic = (top_med - bottom_med) / u_std * reg_w
+                metric_stats[m][horizon].append(ic)
+
+    rows = []
+    for m in eligible_metrics:
+        sz_all, t_all = [], []
+        for h in HORIZONS:
+            vals = metric_stats[m][h]
+            if len(vals) < 2:
+                continue
+            arr = np.array(vals)
+            sz_all.append(float(arr.mean()))
+            t_all.append(float(scipy_stats.ttest_1samp(arr, 0).statistic))
+        if not sz_all or not t_all:
+            continue
+        rows.append({'metric': m, 'avg_sz': float(np.mean(sz_all)), 'avg_t': float(np.mean(t_all))})
+
+    if not rows:
+        return {}
+    df       = pd.DataFrame(rows).set_index('metric')
+    med_sz   = df['avg_sz'].median()
+    med_t    = df['avg_t'].median()
+    eligible = df[(df['avg_sz'] > 0) & (df['avg_sz'] > med_sz) & (df['avg_t'] > med_t)].copy()
+    if eligible.empty:
+        return {}
+    eligible  = eligible.nlargest(MAX_COMPONENTS, 'avg_t')
+    eligible['weight'] = eligible['avg_t'].clip(lower=0)
+    total = eligible['weight'].sum()
+    if total <= 0:
+        return {}
+    eligible['weight'] /= total
+    return eligible['weight'].to_dict()
+
+
 def run_pit_weights(Pxs_df, sectors_s, mode='incremental'):
     """
     Compute and cache point-in-time quality weights for each anchor date.
@@ -154,27 +227,65 @@ def run_pit_weights(Pxs_df, sectors_s, mode='incremental'):
               f"(triggered by anchor {trigger_anchor.date()})", end='', flush=True)
 
         # Only use anchors where anchor + MAX_HORIZON < cutoff (complete forward window)
-        eligible_anchors = {a: snapshots[a] for a in anchor_dates
-                            if a in snapshots
-                            and all_px_dates[all_px_dates > a][MAX_HORIZON - 1] < cutoff
-                            if len(all_px_dates[all_px_dates > a]) >= MAX_HORIZON}
+        eligible_anchors = {}
+        for a in anchor_dates:
+            if a not in snapshots:
+                continue
+            future_a = all_px_dates[all_px_dates > a]
+            if len(future_a) < MAX_HORIZON:
+                continue
+            if future_a[MAX_HORIZON - 1] < cutoff:
+                eligible_anchors[a] = snapshots[a]
 
         if not eligible_anchors:
             print(" — no eligible anchors yet, using equal weights")
             _save_pit_weights(cutoff, {}, {})
             continue
 
-        gqf_w = derive_weights(eligible_anchors, sectors_s, Pxs_df, 'growth')
-        cqf_w = derive_weights(eligible_anchors, sectors_s, Pxs_df, 'conservative')
+        rate_signal = compute_rate_signal(Pxs_df, QF_MAV_WINDOW, QF_THRESHOLD)
 
-        if not gqf_w and not cqf_w:
-            print(" — weight derivation failed, using equal weights")
+        # Each eligible anchor contributes to GQF with weight (1-q) and CQF with weight q
+        # where q is the rate signal at that anchor date (0=easing, 0.5=neutral, 1.0=tight)
+        gqf_anchors = {}
+        cqf_anchors = {}
+        for a, snap in eligible_anchors.items():
+            rate_dates = rate_signal.index[rate_signal.index <= a]
+            q = float(rate_signal.loc[rate_dates[-1]]) if not rate_dates.empty else 0.0
+            if (1 - q) > 0:
+                gqf_anchors[a] = (snap, 1 - q)   # growth weight
+            if q > 0:
+                cqf_anchors[a] = (snap, q)         # conservative weight
+
+        gqf_w = _derive_weights_continuous(gqf_anchors, sectors_s, Pxs_df) if gqf_anchors else {}
+        cqf_w = _derive_weights_continuous(cqf_anchors, sectors_s, Pxs_df) if cqf_anchors else {}
+
+        # If no conservative signal yet, use GQF as fallback for CQF
+        if not cqf_w and gqf_w:
+            cqf_w = gqf_w
+            print(f" — GQF={len(gqf_w)} metrics, CQF=fallback(GQF)", flush=True)
+        elif not gqf_w and not cqf_w:
+            print(" — weight derivation failed, using equal weights", flush=True)
         else:
-            print(f" — GQF={len(gqf_w)} metrics, CQF={len(cqf_w)} metrics")
+            print(f" — GQF={len(gqf_w)} metrics, CQF={len(cqf_w)} metrics", flush=True)
 
         _save_pit_weights(cutoff, gqf_w, cqf_w)
 
     print(f"\n  PIT weights computation complete.")
+
+    # Recompute quality scores using new PIT weights
+    print(f"\n  Recomputing quality scores with PIT weights...")
+    anchor_dates_all = sorted(load_anchor_dates())
+    all_calc_dates   = pd.DatetimeIndex(
+        [pd.Timestamp(a) for a in anchor_dates_all])
+    get_quality_scores(
+        calc_dates         = all_calc_dates,
+        universe           = list(sectors_s.index),
+        Pxs_df             = Pxs_df,
+        sectors_s          = sectors_s,
+        use_cached_weights = False,
+        force_recompute    = True,
+        use_pit_weights    = True,
+    )
 
 
 def get_pit_weights_at(cutoff_date):
