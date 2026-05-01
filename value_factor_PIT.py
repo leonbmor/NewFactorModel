@@ -170,9 +170,8 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
             fut = all_px_dates[all_px_dates > anchor]
             if len(fut) < MAX_HORIZON_VALUE:
                 continue
-            if fut[MAX_HORIZON_VALUE - 1] >= cutoff:
-                continue
-            eligible.append(anchor)
+            if fut[MAX_HORIZON_VALUE - 1] < cutoff:
+                eligible.append(anchor)
 
         if not eligible:
             print(" — no eligible anchors, using equal weights")
@@ -232,6 +231,15 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
         _save_value_pit_weights(cutoff, weights)
 
     print("  Value PIT weights computation complete.")
+
+    # Recompute value scores using new PIT weights
+    print("\n  Recomputing value scores with PIT weights...")
+    _compute_and_save_value_scores(
+        weights_norm    = VALUE_WEIGHTS,   # fallback, overridden per-date by PIT
+        sectors_s       = sectors_s,
+        force_recompute = True,
+        use_pit_weights = True,
+    )
 
 
 def get_value_pit_weights_at(cutoff_date):
