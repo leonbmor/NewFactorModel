@@ -221,7 +221,29 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental',
 
     if not new_dates:
         print("  All value PIT weight dates already cached.")
-        # Always recompute scores for the last valuation date (intraday updates)
+        # Always refresh IC for last anchor date (forward returns extend daily)
+        last_anchor = pd.Timestamp(sorted(anchor_dates)[-1])
+        print(f"  Refreshing IC for last anchor: {last_anchor.date()}")
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"""
+                DELETE FROM {VALUE_IC_CACHE_TBL}
+                WHERE anchor_date = :dt
+            """), {'dt': last_anchor.date()})
+        snap = load_valuation_snapshot(last_anchor)
+        new_ic_rows = []
+        if not snap.empty:
+            for horizon in HORIZONS:
+                resid = compute_residual_returns(Pxs_df, sectors_s, last_anchor, horizon)
+                if resid.empty:
+                    continue
+                for m in METRICS:
+                    ic = compute_ic_for_date(snap, resid, sectors_s, m)
+                    if not np.isnan(ic):
+                        new_ic_rows.append((last_anchor, m, horizon, ic))
+            if new_ic_rows:
+                _save_ic_bank_rows(new_ic_rows)
+                print(f"  Refreshed {len(new_ic_rows)} IC observations for {last_anchor.date()}")
+        # Also refresh value scores for last valuation date
         last_val = load_valuation_dates()
         if last_val:
             last_val_dt = pd.Timestamp(sorted(last_val)[-1])
