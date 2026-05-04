@@ -67,6 +67,8 @@ def _load_pit_weights_cache():
             """)).fetchall()
         result = {}
         for cutoff, regime, metric, weight in rows:
+            if regime == '_sentinel':   # skip sentinel rows
+                continue
             dt = pd.Timestamp(cutoff)
             if dt not in result:
                 result[dt] = {'gqf': {}, 'cqf': {}}
@@ -79,7 +81,7 @@ def _load_pit_weights_cache():
 
 
 def _save_pit_weights(cutoff_date, gqf_w, cqf_w):
-    """Save PIT weights for a cutoff_date. Uses ON CONFLICT DO NOTHING."""
+    """Save PIT weights for a cutoff_date. Saves sentinel row if no weights derived."""
     rows = []
     for metric, weight in gqf_w.items():
         rows.append({'cutoff_date': cutoff_date.date(),
@@ -87,8 +89,10 @@ def _save_pit_weights(cutoff_date, gqf_w, cqf_w):
     for metric, weight in cqf_w.items():
         rows.append({'cutoff_date': cutoff_date.date(),
                      'regime': 'conservative', 'metric': metric, 'weight': float(weight)})
+    # Always save at least a sentinel row so this date appears in cached_dates
     if not rows:
-        return
+        rows.append({'cutoff_date': cutoff_date.date(),
+                     'regime': '_sentinel', 'metric': '_none', 'weight': 0.0})
     with ENGINE.begin() as conn:
         conn.execute(text(f"""
             INSERT INTO {QUALITY_WEIGHTS_PIT_TBL}
@@ -187,9 +191,18 @@ def run_pit_weights(Pxs_df, sectors_s, mode='incremental'):
             conn.execute(text(f"DELETE FROM {QUALITY_WEIGHTS_PIT_TBL}"))
         print(f"  PIT weights cache cleared (rebuild mode)")
 
-    # Load existing cache
+    # Load existing cache — includes dates with real weights
     cached = _load_pit_weights_cache()
-    cached_dates = set(cached.keys())
+
+    # Track all cutoff dates that were ever computed (including equal-weight/sentinel)
+    try:
+        with ENGINE.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT DISTINCT cutoff_date FROM {QUALITY_WEIGHTS_PIT_TBL}
+            """)).fetchall()
+        cached_dates = {pd.Timestamp(r[0]) for r in rows}
+    except Exception:
+        cached_dates = set(cached.keys())
 
     # All anchor dates available
     anchor_dates = sorted(load_anchor_dates())
@@ -217,6 +230,22 @@ def run_pit_weights(Pxs_df, sectors_s, mode='incremental'):
 
     if not new_dates:
         print("  All PIT weight dates already cached.")
+        # Always recompute scores for the last anchor date (intraday price updates)
+        last_anchor = pd.Timestamp(sorted(load_anchor_dates())[-1])
+        print(f"  Refreshing quality scores for last anchor: {last_anchor.date()}")
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"""
+                DELETE FROM {QUALITY_SCORES_TBL} WHERE date = :dt
+            """), {'dt': last_anchor.date()})
+        get_quality_scores(
+            calc_dates         = pd.DatetimeIndex([last_anchor]),
+            universe           = list(sectors_s.index),
+            Pxs_df             = Pxs_df,
+            sectors_s          = sectors_s,
+            use_cached_weights = False,
+            force_recompute    = False,
+            use_pit_weights    = True,
+        )
         return
 
     # Load all snapshots once
@@ -272,20 +301,35 @@ def run_pit_weights(Pxs_df, sectors_s, mode='incremental'):
 
     print(f"\n  PIT weights computation complete.")
 
-    # Recompute quality scores using new PIT weights
-    print(f"\n  Recomputing quality scores with PIT weights...")
+    if not new_dates:
+        return
+
+    # Delete and recompute quality scores only for anchor dates >= first new PIT cutoff
+    new_cutoffs      = [c for _, c in new_dates]
+    first_new_cutoff = min(new_cutoffs)
     anchor_dates_all = sorted(load_anchor_dates())
-    all_calc_dates   = pd.DatetimeIndex(
-        [pd.Timestamp(a) for a in anchor_dates_all])
-    get_quality_scores(
-        calc_dates         = all_calc_dates,
-        universe           = list(sectors_s.index),
-        Pxs_df             = Pxs_df,
-        sectors_s          = sectors_s,
-        use_cached_weights = False,
-        force_recompute    = True,
-        use_pit_weights    = True,
-    )
+    affected = pd.DatetimeIndex(
+        [pd.Timestamp(a) for a in anchor_dates_all
+         if pd.Timestamp(a) >= first_new_cutoff])
+
+    if not affected.empty:
+        print(f"\n  Recomputing {len(affected)} quality score dates "
+              f"from {first_new_cutoff.date()} onwards...")
+        # Delete affected dates from cache so they get recomputed
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"""
+                DELETE FROM {QUALITY_SCORES_TBL}
+                WHERE date = ANY(:dates)
+            """), {'dates': [d.date() for d in affected]})
+        get_quality_scores(
+            calc_dates         = affected,
+            universe           = list(sectors_s.index),
+            Pxs_df             = Pxs_df,
+            sectors_s          = sectors_s,
+            use_cached_weights = False,
+            force_recompute    = False,
+            use_pit_weights    = True,
+        )
 
 
 def get_pit_weights_at(cutoff_date):

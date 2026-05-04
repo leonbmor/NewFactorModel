@@ -101,6 +101,8 @@ def _load_value_pit_cache():
             """)).fetchall()
         result = {}
         for cutoff, metric, weight in rows:
+            if metric == '_sentinel':
+                continue
             dt = pd.Timestamp(cutoff)
             if dt not in result:
                 result[dt] = {}
@@ -115,7 +117,8 @@ def _save_value_pit_weights(cutoff_date, weights):
     rows = [{'cutoff_date': cutoff_date.date(), 'metric': m, 'weight': float(w)}
             for m, w in weights.items()]
     if not rows:
-        return
+        rows = [{'cutoff_date': cutoff_date.date(),
+                 'metric': '_sentinel', 'weight': 0.0}]
     with ENGINE.begin() as conn:
         conn.execute(text(f"""
             INSERT INTO {VALUE_WEIGHTS_PIT_TBL} (cutoff_date, metric, weight)
@@ -140,7 +143,14 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
         print("  Value PIT weights cache cleared (rebuild mode)")
 
     cached       = _load_value_pit_cache()
-    cached_dates = set(cached.keys())
+    try:
+        with ENGINE.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT DISTINCT cutoff_date FROM {VALUE_WEIGHTS_PIT_TBL}
+            """)).fetchall()
+        cached_dates = {pd.Timestamp(r[0]) for r in rows}
+    except Exception:
+        cached_dates = set(cached.keys())
     anchor_dates = load_valuation_dates()
     all_px_dates = Pxs_df.index
 
@@ -158,13 +168,54 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
 
     if not new_dates:
         print("  All value PIT weight dates already cached.")
+        # Always recompute scores for the last valuation date (intraday updates)
+        last_val = load_valuation_dates()
+        if last_val:
+            last_val_dt = pd.Timestamp(sorted(last_val)[-1])
+            print(f"  Refreshing value scores for last valuation date: {last_val_dt.date()}")
+            _compute_and_save_value_scores(
+                weights_norm    = VALUE_WEIGHTS,
+                sectors_s       = sectors_s,
+                force_recompute = False,
+                use_pit_weights = True,
+                min_date        = last_val_dt,
+            )
         return
 
+    # ── Pre-compute all IC observations once upfront ──────────────────────────
+    # ic_bank[(anchor, metric, horizon)] = ic_value
+    # This avoids recomputing anchor ICs for every cutoff date
+    print("  Pre-computing IC observations for all eligible anchors...")
+    all_eligible_anchors = set()
+    for _, cutoff in new_dates:
+        for anchor in anchor_dates:
+            fut = all_px_dates[all_px_dates > anchor]
+            if len(fut) >= MAX_HORIZON_VALUE and fut[MAX_HORIZON_VALUE - 1] < cutoff:
+                all_eligible_anchors.add(anchor)
+
+    ic_bank = {}
+    for j, anchor in enumerate(sorted(all_eligible_anchors), 1):
+        if j % 10 == 0:
+            print(f"    [{j}/{len(all_eligible_anchors)}] anchor={anchor.date()}", flush=True)
+        snap = load_valuation_snapshot(anchor)
+        if snap.empty:
+            continue
+        for horizon in HORIZONS:
+            resid = compute_residual_returns(Pxs_df, sectors_s, anchor, horizon)
+            if resid.empty:
+                continue
+            for m in METRICS:
+                ic = compute_ic_for_date(snap, resid, sectors_s, m)
+                if not np.isnan(ic):
+                    ic_bank[(anchor, m, horizon)] = ic
+    print(f"  IC bank built: {len(ic_bank)} observations")
+
+    # ── Now compute weights per cutoff using cached IC bank ───────────────────
     for i, (trigger_anchor, cutoff) in enumerate(new_dates, 1):
         print(f"  [{i}/{len(new_dates)}] cutoff={cutoff.date()} "
               f"(anchor {trigger_anchor.date()})", end='', flush=True)
 
-        # Only use anchors with complete forward windows before cutoff
+        # Eligible anchors for this cutoff
         eligible = []
         for anchor in anchor_dates:
             fut = all_px_dates[all_px_dates > anchor]
@@ -175,41 +226,17 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
 
         if not eligible:
             print(" — no eligible anchors, using equal weights")
-            equal = {m: 1.0 / len(METRICS) for m in METRICS}
-            _save_value_pit_weights(cutoff, equal)
+            _save_value_pit_weights(cutoff, {m: 1.0/len(METRICS) for m in METRICS})
             continue
 
-        # Compute IC for each eligible anchor and aggregate
-        ic_records = []
-        for anchor in eligible:
-            snap = load_valuation_snapshot(anchor)
-            if snap.empty:
-                continue
-            row = {}
-            for horizon in HORIZONS:
-                resid = compute_residual_returns(Pxs_df, sectors_s, anchor, horizon)
-                if resid.empty:
-                    continue
-                for m in METRICS:
-                    ic = compute_ic_for_date(snap, resid, sectors_s, m)
-                    if not np.isnan(ic):
-                        row[(m, horizon)] = ic
-            if row:
-                ic_records.append(row)
-
-        if not ic_records:
-            print(" — no IC computed, using equal weights")
-            equal = {m: 1.0 / len(METRICS) for m in METRICS}
-            _save_value_pit_weights(cutoff, equal)
-            continue
-
-        # Aggregate IC across anchors and horizons — IC t-stat weighting
+        # Aggregate IC from bank
         metric_ics = {m: [] for m in METRICS}
-        for rec in ic_records:
+        for anchor in eligible:
             for m in METRICS:
-                vals = [rec[(m, h)] for h in HORIZONS if (m, h) in rec]
-                if vals:
-                    metric_ics[m].extend(vals)
+                for horizon in HORIZONS:
+                    ic = ic_bank.get((anchor, m, horizon))
+                    if ic is not None:
+                        metric_ics[m].append(ic)
 
         weights = {}
         for m in METRICS:
@@ -232,13 +259,18 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
 
     print("  Value PIT weights computation complete.")
 
-    # Recompute value scores using new PIT weights
-    print("\n  Recomputing value scores with PIT weights...")
+    if not new_dates:
+        return
+
+    new_cutoffs      = [c for _, c in new_dates]
+    first_new_cutoff = min(new_cutoffs)
+    print(f"\n  Recomputing value scores from {first_new_cutoff.date()} onwards...")
     _compute_and_save_value_scores(
-        weights_norm    = VALUE_WEIGHTS,   # fallback, overridden per-date by PIT
+        weights_norm    = VALUE_WEIGHTS,
         sectors_s       = sectors_s,
-        force_recompute = True,
+        force_recompute = False,
         use_pit_weights = True,
+        min_date        = first_new_cutoff,
     )
 
 
@@ -567,7 +599,8 @@ def _ensure_value_scores_table():
 def _compute_and_save_value_scores(weights_norm: dict,
                                     sectors_s: pd.Series,
                                     force_recompute: bool = False,
-                                    use_pit_weights: bool = False):
+                                    use_pit_weights: bool = False,
+                                    min_date: pd.Timestamp = None):
     """
     Compute IC-weighted value composite scores for all valuation dates
     and save to value_scores_df. Only computes missing dates unless
@@ -595,6 +628,9 @@ def _compute_and_save_value_scores(weights_norm: dict,
     if not all_val_dates:
         print("  WARNING: No valuation dates found.")
         return
+
+    if min_date is not None:
+        all_val_dates = [d for d in all_val_dates if d >= min_date]
 
     if force_recompute:
         dates_to_compute = all_val_dates
