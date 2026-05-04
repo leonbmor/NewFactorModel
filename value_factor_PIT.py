@@ -243,18 +243,6 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental',
             if new_ic_rows:
                 _save_ic_bank_rows(new_ic_rows)
                 print(f"  Refreshed {len(new_ic_rows)} IC observations for {last_anchor.date()}")
-        # Also refresh value scores for last valuation date
-        last_val = load_valuation_dates()
-        if last_val:
-            last_val_dt = pd.Timestamp(sorted(last_val)[-1])
-            print(f"  Refreshing value scores for last valuation date: {last_val_dt.date()}")
-            _compute_and_save_value_scores(
-                weights_norm    = VALUE_WEIGHTS,
-                sectors_s       = sectors_s,
-                force_recompute = False,
-                use_pit_weights = True,
-                min_date        = last_val_dt,
-            )
         return
 
     # ── IC bank: load cache, compute only missing anchors ────────────────────
