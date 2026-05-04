@@ -71,7 +71,55 @@ VALUE_WEIGHTS = {
 # Set True once weights above are populated
 _VALUE_WEIGHTS_READY = True
 
-VALUE_WEIGHTS_PIT_TBL = 'value_weights_pit'
+VALUE_IC_CACHE_TBL    = 'value_ic_bank'
+
+
+def _ensure_ic_cache_table():
+    with ENGINE.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {VALUE_IC_CACHE_TBL} (
+                anchor_date  DATE        NOT NULL,
+                metric       VARCHAR(20) NOT NULL,
+                horizon      INTEGER     NOT NULL,
+                ic           FLOAT       NOT NULL,
+                PRIMARY KEY  (anchor_date, metric, horizon)
+            )
+        """))
+
+
+def _load_ic_bank_from_db():
+    """Load cached IC observations. Returns dict {(anchor, metric, horizon): ic}"""
+    _ensure_ic_cache_table()
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT anchor_date, metric, horizon, ic FROM {VALUE_IC_CACHE_TBL}
+        """)).fetchall()
+    return {(pd.Timestamp(r[0]), r[1], r[2]): float(r[3]) for r in rows}
+
+
+def _save_ic_bank_rows(new_rows):
+    """Save new IC observations to DB. new_rows: list of (anchor, metric, horizon, ic)"""
+    if not new_rows:
+        return
+    rows = [{'anchor_date': a.date(), 'metric': m, 'horizon': h, 'ic': float(ic)}
+            for a, m, h, ic in new_rows]
+    with ENGINE.begin() as conn:
+        conn.execute(text(f"""
+            INSERT INTO {VALUE_IC_CACHE_TBL}
+                (anchor_date, metric, horizon, ic)
+            VALUES (:anchor_date, :metric, :horizon, :ic)
+            ON CONFLICT (anchor_date, metric, horizon) DO NOTHING
+        """), rows)
+
+
+def _get_cached_ic_anchors():
+    """Return set of anchor dates already in IC bank."""
+    _ensure_ic_cache_table()
+    with ENGINE.connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT DISTINCT anchor_date FROM {VALUE_IC_CACHE_TBL}
+        """)).fetchall()
+    return {pd.Timestamp(r[0]) for r in rows}
 MAX_HORIZON_VALUE     = max(HORIZONS)   # 63 days
 
 # ==============================================================================
@@ -127,20 +175,25 @@ def _save_value_pit_weights(cutoff_date, weights):
         """), rows)
 
 
-def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
+def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental',
+                           force_recompute_ic=False):
     """
     Compute and cache point-in-time value weights for each anchor date.
-    At cutoff T, only uses anchors where anchor + MAX_HORIZON_VALUE trading days < T.
 
     mode='incremental': only new cutoff dates
     mode='rebuild'    : wipe and recompute all
+    force_recompute_ic: wipe and recompute IC bank (slow, only needed when
+                        residuals change significantly)
     """
     _ensure_value_pit_table()
 
     if mode == 'rebuild':
         with ENGINE.begin() as conn:
-            conn.execute(text(f"DELETE FROM {VALUE_WEIGHTS_PIT_TBL}"))
-        print("  Value PIT weights cache cleared (rebuild mode)")
+            conn.execute(text(f"DROP TABLE IF EXISTS {VALUE_WEIGHTS_PIT_TBL}"))
+            conn.execute(text(f"DROP TABLE IF EXISTS {VALUE_IC_CACHE_TBL}"))
+        _ensure_value_pit_table()
+        _ensure_ic_cache_table()
+        print("  Value PIT weights and IC bank cache cleared (rebuild mode)")
 
     cached       = _load_value_pit_cache()
     try:
@@ -182,10 +235,17 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
             )
         return
 
-    # ── Pre-compute all IC observations once upfront ──────────────────────────
-    # ic_bank[(anchor, metric, horizon)] = ic_value
-    # This avoids recomputing anchor ICs for every cutoff date
-    print("  Pre-computing IC observations for all eligible anchors...")
+    # ── IC bank: load cache, compute only missing anchors ────────────────────
+    if force_recompute_ic:
+        with ENGINE.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {VALUE_IC_CACHE_TBL}"))
+        _ensure_ic_cache_table()
+        print("  IC bank cache cleared (force_recompute_ic=True)")
+
+    ic_bank          = _load_ic_bank_from_db()
+    cached_ic_anchors = _get_cached_ic_anchors()
+
+    # All eligible anchors across all cutoffs
     all_eligible_anchors = set()
     for _, cutoff in new_dates:
         for anchor in anchor_dates:
@@ -193,10 +253,14 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
             if len(fut) >= MAX_HORIZON_VALUE and fut[MAX_HORIZON_VALUE - 1] < cutoff:
                 all_eligible_anchors.add(anchor)
 
-    ic_bank = {}
-    for j, anchor in enumerate(sorted(all_eligible_anchors), 1):
+    missing_anchors = sorted(all_eligible_anchors - cached_ic_anchors)
+    print(f"  IC bank: {len(cached_ic_anchors)} anchors cached, "
+          f"{len(missing_anchors)} to compute")
+
+    new_ic_rows = []
+    for j, anchor in enumerate(missing_anchors, 1):
         if j % 10 == 0:
-            print(f"    [{j}/{len(all_eligible_anchors)}] anchor={anchor.date()}", flush=True)
+            print(f"    [{j}/{len(missing_anchors)}] anchor={anchor.date()}", flush=True)
         snap = load_valuation_snapshot(anchor)
         if snap.empty:
             continue
@@ -208,7 +272,12 @@ def run_pit_weights_value(Pxs_df, sectors_s, mode='incremental'):
                 ic = compute_ic_for_date(snap, resid, sectors_s, m)
                 if not np.isnan(ic):
                     ic_bank[(anchor, m, horizon)] = ic
-    print(f"  IC bank built: {len(ic_bank)} observations")
+                    new_ic_rows.append((anchor, m, horizon, ic))
+
+    if new_ic_rows:
+        _save_ic_bank_rows(new_ic_rows)
+        print(f"  Saved {len(new_ic_rows)} new IC observations to DB")
+    print(f"  IC bank total: {len(ic_bank)} observations")
 
     # ── Now compute weights per cutoff using cached IC bank ───────────────────
     for i, (trigger_anchor, cutoff) in enumerate(new_dates, 1):
